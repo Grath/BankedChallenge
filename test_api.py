@@ -10,6 +10,15 @@ fake = Faker()
 
 
 def test_successful_transaction():
+    """
+    Run through a complete demo payment process, using API calls.
+    - New customer on create-demo-payment API
+    - Initiate session using token returned from create-demo-payment
+    - Follow select_provider action from session response, using Mock Bank AU provider.
+    - Follow initiate_authorisation action from select_provider response.
+    - Poll result URL from initiate_authorisation response until result is not 'awaiting_authorisation', 'pending',
+      or 20 instances of incremental backoff have been waited through.
+    """
     create_resp = requests.post("https://demo.banked.com/new/api/create-demo-payment",
                                 json={"line_items": "single", "region": "AU", "customer": "new-customer", "checkoutV3Header": True})
     assert create_resp.status_code == 200
@@ -66,3 +75,69 @@ def test_successful_transaction():
         time.sleep(wait)
     assert checkout_json["payment"]["state"] == "sent"
 
+
+def test_missing_idempotency():
+    """
+    Because financial transactions impose substantial penalties if they are mistakenly re-applied, requests other than
+    the initial create-demo-payment with no idempotency-key header are rejected.
+    """
+    create_resp = requests.post("https://demo.banked.com/new/api/create-demo-payment",
+                                json={"line_items": "single", "region": "AU", "customer": "new-customer", "checkoutV3Header": True})
+    assert create_resp.status_code == 200
+    create_json = json.loads(create_resp.text)
+    assert "url" in create_json
+    assert "id" in create_json
+    token_query = urlparse(create_json["url"]).query
+    sessions_resp = requests.post(f"https://api.banked.com/checkout/v3/sessions?checkout_region=au&{token_query}",
+                                  json={"locale": None, "payment_id": create_json["id"]})
+    assert sessions_resp.status_code == 400
+
+
+def test_no_account_number():
+    """
+    Send a request which has no account number associated with it, which should be rejected as invalid.
+    """
+    create_resp = requests.post("https://demo.banked.com/new/api/create-demo-payment",
+                                json={"line_items": "single", "region": "AU", "customer": "new-customer", "checkoutV3Header": True})
+    assert create_resp.status_code == 200
+    create_json = json.loads(create_resp.text)
+    assert "url" in create_json
+    assert "id" in create_json
+    token_query = urlparse(create_json["url"]).query
+    sessions_resp = requests.post(f"https://api.banked.com/checkout/v3/sessions?checkout_region=au&{token_query}",
+                                  headers={"Idempotency-Key":str(uuid4())},
+                                  json={"locale": None, "payment_id": create_json["id"]})
+    assert sessions_resp.status_code == 201
+    sessions_json = json.loads(sessions_resp.text)
+    assert "actions" in sessions_json
+    for action in sessions_json["actions"]:
+        if action["action"] == "select_provider":
+            for provider in action["data"]["providers"]:
+                if provider["name"] == "Mock Bank AU":
+                    provider_id = provider["id"]
+                    break
+            else:
+                pytest.fail(f"Mock Bank AU provider not found in sessions response, got:\n{json.dumps(sessions_json, indent=2)}")
+
+            select_provider_resp = requests.patch(f"{action['href']}?checkout_region=au&{token_query}",
+                                                  headers={"Idempotency-Key":str(uuid4())},
+                                                  json={"provider_id": provider_id})
+            break
+    else:
+        pytest.fail(f"There is no select_provider action in sessions response, got:\n{json.dumps(sessions_json, indent=2)}")
+    assert select_provider_resp.status_code == 200
+    select_provider_json = json.loads(select_provider_resp.text)
+    assert "actions" in select_provider_json
+    for action in select_provider_json["actions"]:
+        if action["action"] == "initiate_authorisation":
+            initiate_authorisation_resp = requests.patch(f"{action['href']}?checkout_region=au&{token_query}",
+                                                         headers={"Idempotency-Key": str(uuid4())},
+                                                         json={"terms_accepted": True, "remember_me": False, "masked_details": False,
+                                                               "supplemental_checkout_attributes": {
+                                                                   "ACCOUNT_NAME": fake.name(),
+                                                                   "BSB_NUMBER": "111114"
+                                                               }})
+            break
+    else:
+        pytest.fail(f"There is no initiate_authorisation action in select_provider response, got:\n{json.dumps(select_provider_json, indent=2)}")
+    assert initiate_authorisation_resp.status_code == 400
